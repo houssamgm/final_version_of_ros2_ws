@@ -17,6 +17,7 @@ class LeaderCurve(Node):
     def loop(self):
         now = self.get_clock().now().seconds_nanoseconds()[0]
         t = now - self.start_time
+    
 
         cmd = Twist()
 

@@ -16,23 +16,32 @@
 
 using std::placeholders::_1;
 
-class PIDFollow : public rclcpp::Node
+class ACCFollow : public rclcpp::Node
 {
 public:
-    PIDFollow()
-    : Node("pid_follow"),
+    ACCFollow()
+    : Node("acc_follow"),
       tf_buffer_(this->get_clock()),
       tf_listener_(tf_buffer_)
     {
-        // ---------- PID parameters ----------
-        d_ref_ = 0.7;
-        Kp_ = 3;
-        Ki_ = 0.0;
-        Kd_ = 0.5;
-        Kp_angle_ = 3.0;
+        // ---------- ACC parameters ----------
+        // Constant Time Headway Spacing Policy
+        headway_time_ = 0.8;   // seconds
+        min_distance_ = 0.5;   // absolute minimum safe gap
+
+        // Controller Gains
+        Kp_acc_ = 3;         // Gap error proportional gain
+        Kv_acc_ = 1;         // Relative velocity derivative gain
+        Kp_angle_ = 3.0;       // Heading gain
 
         v_max_ = 0.6;
-        w_max_ = 3;
+        w_max_ = 3.0;
+
+        // ACC Memory & Filtering
+        prev_distance_ = min_distance_;
+        filtered_rel_vel_ = 0.0;
+        vel_filter_alpha_ = 0.25; // Low-pass filter coefficient for noisy derivative
+        prev_time_ = this->get_clock()->now();
 
         // ---------- DWA safety parameters ----------
         max_accel_ = 0.6;
@@ -43,31 +52,30 @@ public:
         w_reso_ = 0.10;
         robot_radius_ = 0.22;
 
-        // PID memory
-        integral_ = 0.0;
-        prev_error_ = 0.0;
-        prev_time_ = this->get_clock()->now();
+        prev_v_ = 0.0;
+        prev_w_ = 0.0;
+        smooth_gain_ = 0.2;
 
-        // ROS
         cmd_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
 
         scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
             "/scan", 10,
-            std::bind(&PIDFollow::scan_callback, this, _1));
+            std::bind(&ACCFollow::scan_callback, this, _1));
 
         timer_ = this->create_wall_timer(
             std::chrono::milliseconds(100),
-            std::bind(&PIDFollow::control_loop, this));
+            std::bind(&ACCFollow::control_loop, this));
 
-        RCLCPP_INFO(this->get_logger(), "PID follower with heading error metric started");
+        RCLCPP_INFO(this->get_logger(), "ACC follower with heading error metric started");
     }
 
 private:
     // ---------- Parameters ----------
-    double d_ref_;
-    double Kp_;
-    double Ki_;
-    double Kd_;
+    // ACC gains & spacing
+    double headway_time_;
+    double min_distance_;
+    double Kp_acc_;
+    double Kv_acc_;
     double Kp_angle_;
 
     double v_max_;
@@ -88,16 +96,18 @@ private:
     double max_oscillation_ = 0.0;
     int prev_sign_ = 0;
 
-    // ---------- PID memory ----------
+    // ACC Memory
+    double prev_distance_;
+    double filtered_rel_vel_;
+    double vel_filter_alpha_;
+    rclcpp::Time prev_time_;
+
+    // smoothing
     double prev_v_ = 0.0;
     double prev_w_ = 0.0;
     double smooth_gain_ = 0.2;
 
-    double integral_;
-    double prev_error_;
-    rclcpp::Time prev_time_;
-
-    // ---------- ROS ----------
+    // ROS
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
@@ -145,60 +155,41 @@ private:
 
         for (const auto & point : traj)
         {
-            double x = point.first;
-            double y = point.second;
-
             for (size_t i = 0; i < scan_->ranges.size(); ++i)
             {
                 double r = scan_->ranges[i];
+                if (std::isinf(r) || std::isnan(r)) continue;
 
-                if (std::isinf(r) || std::isnan(r))
-                {
-                    continue;
-                }
-
-                double angle = scan_->angle_min + static_cast<double>(i) * scan_->angle_increment;
+                double angle = scan_->angle_min + i * scan_->angle_increment;
 
                 double obs_x = r * std::cos(angle);
                 double obs_y = r * std::sin(angle);
 
-                double dist = std::hypot(x - obs_x, y - obs_y);
+                double dist = std::hypot(point.first - obs_x, point.second - obs_y);
 
                 if (dist < min_dist)
-                {
                     min_dist = dist;
-                }
             }
         }
 
-        if (std::isinf(min_dist))
-        {
-            return 0.0;
-        }
-
-        if (min_dist < robot_radius_)
-        {
-            return std::numeric_limits<double>::infinity();
-        }
+        if (std::isinf(min_dist)) return 0.0;
+        if (min_dist < robot_radius_) return std::numeric_limits<double>::infinity();
 
         return 1.0 / (min_dist + 0.01);
     }
 
     // --------------------------------------------------
-    std::pair<double, double> dwa_safety_filter(double v_pid, double w_pid)
+    std::pair<double, double> dwa_safety_filter(double v_cmd, double w_cmd)
     {
-        if (!scan_)
-        {
-            return {v_pid, w_pid};
-        }
+        if (!scan_) return {v_cmd, w_cmd};
 
-        double min_v = std::max(-v_max_, v_pid - max_accel_ * dt_sim_);
-        double max_v = std::min(v_max_,  v_pid + max_accel_ * dt_sim_);
+        double min_v = std::max(-v_max_, v_cmd - max_accel_ * dt_sim_);
+        double max_v = std::min(v_max_,  v_cmd + max_accel_ * dt_sim_);
 
-        double angle_expand = (std::abs(v_pid) > 0.05) ? 0.7 : 0.4;
+        double angle_expand = (std::abs(v_cmd) > 0.05) ? 0.7 : 0.4;
 
-        double min_w = std::max(-w_max_, w_pid - max_delta_w_ * dt_sim_ - angle_expand);
-        double max_w = std::min(w_max_,  w_pid + max_delta_w_ * dt_sim_ + angle_expand);
+        double min_w = std::max(-w_max_, w_cmd - max_delta_w_ * dt_sim_ - angle_expand);
+        double max_w = std::min(w_max_,  w_cmd + max_delta_w_ * dt_sim_ + angle_expand);
 
         double best_v = 0.0;
         double best_w = 0.0;
@@ -210,29 +201,20 @@ private:
 
         for (int i = 0; i <= n_v + 1; ++i)
         {
-            double v = min_v + static_cast<double>(i) * v_reso_;
-            if (v > max_v + v_reso_ * 0.5)
-            {
-                continue;
-            }
+            double v = min_v + i * v_reso_;
+            if (v > max_v + v_reso_ * 0.5) continue;
 
             for (int j = 0; j <= n_w + 1; ++j)
             {
-                double w = min_w + static_cast<double>(j) * w_reso_;
-                if (w > max_w + w_reso_ * 0.5)
-                {
-                    continue;
-                }
+                double w = min_w + j * w_reso_;
+                if (w > max_w + w_reso_ * 0.5) continue;
 
                 auto traj = predict_trajectory(v, w);
                 double obstacle_cost = calc_obstacle_cost(traj);
 
-                if (std::isinf(obstacle_cost))
-                {
-                    continue;
-                }
+                if (std::isinf(obstacle_cost)) continue;
 
-                double tracking_cost = std::abs(v - v_pid) + std::abs(w - w_pid);
+                double tracking_cost = std::abs(v - v_cmd) + std::abs(w - w_cmd);
                 double final_cost = 3.5 * obstacle_cost + 4.0 * tracking_cost;
 
                 if (final_cost < min_cost)
@@ -246,9 +228,7 @@ private:
         }
 
         if (!found)
-        {
             return {0.0, 0.8};
-        }
 
         return {best_v, best_w};
     }
@@ -264,6 +244,8 @@ private:
     void control_loop()
     {
         auto loop_start = std::chrono::high_resolution_clock::now();
+        rclcpp::Time now = this->get_clock()->now();
+
         geometry_msgs::msg::TransformStamped trans;
 
         try
@@ -283,71 +265,79 @@ private:
 
         double distance = std::sqrt(dx * dx + dy * dy);
 
-        // ---------- Distance PID ----------
-        double error = distance - d_ref_;
-        double err_abs = std::abs(error);
-
-        rclcpp::Time now = this->get_clock()->now();
+        // =========================================================
+        //                🚗 KINEMATIC ACC CONTROLLER
+        // =========================================================
+        
+        // Calculate dt for derivative
         double dt = (now - prev_time_).nanoseconds() / 1e9;
-        if (dt == 0.0)
-        {
-            return;
-        }
+        if (dt <= 0.0) return;
 
-        // --- PID memory update ---
-        integral_ += error * dt;
-        double derivative = (error - prev_error_) / dt;
+        // Estimate relative velocity & apply low-pass filter to smooth TF noise
+        double raw_rel_vel = (distance - prev_distance_) / dt;
+        filtered_rel_vel_ = vel_filter_alpha_ * raw_rel_vel + (1.0 - vel_filter_alpha_) * filtered_rel_vel_;
 
-        // --- RAW PID output ---
-        double v_raw = Kp_ * error + Ki_ * integral_ + Kd_ * derivative;
-        v_raw = std::max(std::min(v_raw, v_max_), -v_max_);
+        // 1. Determine Desired Gap (Constant Time Headway policy)
+        double desired_gap = min_distance_ + headway_time_ * std::max(0.0, prev_v_);
+        
+        // 2. Calculate Gap Error
+        double gap_error = distance - desired_gap;
 
-        // ---------- Heading ----------
+        // 3. ACC Control Law (PD on gap distance)
+        double v_acc = Kp_acc_ * gap_error + Kv_acc_ * filtered_rel_vel_;
+
+        double v_raw = std::clamp(v_acc, -v_max_, v_max_);
+
+        // Angular controller
         double angle_error = std::atan2(dy, dx);
         double heading_err_abs = std::abs(angle_error);
-
         double w_raw = Kp_angle_ * angle_error;
-        w_raw = std::max(std::min(w_raw, w_max_), -w_max_);
+        w_raw = std::clamp(w_raw, -w_max_, w_max_);
 
-        // ---------- DWA Obstacle Layer ----------
+        // Update memory for next loop
+        prev_distance_ = distance;
+        prev_time_ = now;
+
+        // =========================================================
+        // DWA layer
+        // =========================================================
         auto filtered = dwa_safety_filter(v_raw, w_raw);
 
-        // --- SMOOTHING (AFTER DWA) ---
         double v = (1.0 - smooth_gain_) * filtered.first + smooth_gain_ * prev_v_;
         double w = (1.0 - smooth_gain_) * filtered.second + smooth_gain_ * prev_w_;
 
         prev_v_ = v;
         prev_w_ = w;
 
-        // ---------- Publish ----------
         geometry_msgs::msg::Twist cmd;
         cmd.linear.x = v;
         cmd.angular.z = w;
+
         cmd_pub_->publish(cmd);
 
-        prev_error_ = error;
-        prev_time_ = now;
-
         auto loop_end = std::chrono::high_resolution_clock::now();
-        double loop_time_ms = std::chrono::duration<double, std::milli>(loop_end - loop_start).count();
+        double loop_time_ms =
+            std::chrono::duration<double, std::milli>(loop_end - loop_start).count();
+
+        double err_abs = std::abs(gap_error);
 
         // --- Start detection after reaching setpoint zone ---
-        if (!reached_setpoint_ && std::abs(error) < zero_band_)
+        if (!reached_setpoint_ && std::abs(gap_error) < zero_band_)
         {
             reached_setpoint_ = true;
             prev_sign_ = 0;
         }
 
-        // --- Oscillation Tracking Logic (Distance error based) ---
+        // --- Oscillation Tracking Logic ---
         if (reached_setpoint_)
         {
-            int current_sign = sign_of(error);
+            int current_sign = sign_of(gap_error);
 
             if (current_sign != 0)
             {
-                if (std::abs(error) > max_oscillation_)
+                if (std::abs(gap_error) > max_oscillation_)
                 {
-                    max_oscillation_ = std::abs(error);
+                    max_oscillation_ = std::abs(gap_error);
                 }
             }
 
@@ -362,7 +352,7 @@ private:
             }
         }
 
-        // --- UPDATED PARSER FORMAT ---
+        // --- UNIFIED PARSER FORMAT ---
         RCLCPP_INFO(
             this->get_logger(),
             "err=%.3f | osc_count=%d | max_osc=%.3f | time=%.3f ms | heading_err=%.3f",
@@ -378,7 +368,7 @@ private:
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<PIDFollow>();
+    auto node = std::make_shared<ACCFollow>();
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;

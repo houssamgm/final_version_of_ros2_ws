@@ -4,7 +4,7 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
-#include <tf2/time.h>
+#include <tf2/time.h> 
 
 #include <cmath>
 #include <vector>
@@ -14,11 +14,11 @@
 
 using std::placeholders::_1;
 
-class WOA_Follow : public rclcpp::Node
+class PSO_Follow : public rclcpp::Node
 {
 public:
-    WOA_Follow()
-    : Node("woa_follow"),
+    PSO_Follow()
+    : Node("pso_follow"),
       tf_buffer_(this->get_clock()),
       tf_listener_(tf_buffer_)
     {
@@ -31,7 +31,7 @@ public:
         alpha_ = 2.0;
         beta_ = 1.5;
 
-        n_whales_ = 20;
+        swarm_size_ = 20;
         max_iter_ = 50;
 
         dt_ = 0.3;
@@ -47,27 +47,33 @@ public:
 
         prev_v_ = 0.0;
         prev_w_ = 0.0;
-        smooth_gain_ = 0.3;
+        smooth_gain_ = 0.2;
+
+        w_inertia_ = 0.72;
+        c1_ = 1.5;
+        c2_ = 1.5;
 
         cmd_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
 
         scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-            "/scan", 10, std::bind(&WOA_Follow::scan_callback, this, _1));
+            "/scan", 10, std::bind(&PSO_Follow::scan_callback, this, _1));
 
         timer_ = this->create_wall_timer(
             std::chrono::milliseconds(100),
-            std::bind(&WOA_Follow::control_loop, this));
+            std::bind(&PSO_Follow::control_loop, this));
 
-        RCLCPP_INFO(this->get_logger(), "WOA follower with unified metrics logging started");
+        RCLCPP_INFO(this->get_logger(), "PSO follower with heading error metric started");
     }
 
 private:
+    // ===== params =====
     double d_ref_, stop_threshold_;
     double v_max_, w_max_;
     double alpha_, beta_;
-    int n_whales_, max_iter_;
-    double dt_, b_;
 
+    int swarm_size_, max_iter_;
+
+    double dt_, b_;
     double max_accel_, max_delta_w_;
     double predict_time_, dt_sim_;
     double v_reso_, w_reso_;
@@ -81,6 +87,17 @@ private:
     int prev_sign_ = 0;
 
     double prev_v_, prev_w_, smooth_gain_;
+
+    double w_inertia_, c1_, c2_;
+
+    // ===== PSO state =====
+    std::vector<std::vector<double>> particles_;
+    std::vector<std::vector<double>> velocities_;
+    std::vector<std::vector<double>> pbest_;
+    std::vector<double> pbest_score_;
+
+    std::vector<double> gbest_;
+    double gbest_score_;
 
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
@@ -130,99 +147,75 @@ private:
         return alpha_ * e_d + beta_ * e_theta + effort;
     }
 
-    std::pair<double,double> woa_optimize(double dx, double dy)
+    void init_pso()
     {
-        std::uniform_real_distribution<double> rand01(0.0, 1.0);
-        std::uniform_real_distribution<double> randL(-1.0, 1.0);
+        particles_.resize(swarm_size_, std::vector<double>(2));
+        velocities_.resize(swarm_size_, std::vector<double>(2, 0.0));
+        pbest_.resize(swarm_size_, std::vector<double>(2));
+        pbest_score_.resize(swarm_size_);
 
-        std::vector<std::vector<double>> whales(n_whales_, std::vector<double>(2));
+        std::uniform_real_distribution<double> vdist(-v_max_, v_max_);
+        std::uniform_real_distribution<double> wdist(-w_max_, w_max_);
 
-        for (auto &w : whales)
+        for (int i = 0; i < swarm_size_; i++)
         {
-            w[0] = std::uniform_real_distribution<double>(-v_max_, v_max_)(gen_);
-            w[1] = std::uniform_real_distribution<double>(-w_max_, w_max_)(gen_);
+            particles_[i][0] = vdist(gen_);
+            particles_[i][1] = wdist(gen_);
+
+            pbest_[i] = particles_[i];
+            pbest_score_[i] = std::numeric_limits<double>::infinity();
         }
+    }
 
-        std::vector<double> fitness_vals(n_whales_);
-        for (int i = 0; i < n_whales_; ++i)
-            fitness_vals[i] = fitness(whales[i], dx, dy);
+    std::pair<double,double> pso_optimize(double dx, double dy)
+    {
+        init_pso();
 
-        int best_idx = std::min_element(fitness_vals.begin(), fitness_vals.end()) - fitness_vals.begin();
-        std::vector<double> X_best = whales[best_idx];
-        double F_best = fitness_vals[best_idx];
+        std::uniform_real_distribution<double> r01(0.0, 1.0);
 
-        for (int t = 0; t < max_iter_; ++t)
+        for (int iter = 0; iter < max_iter_; iter++)
         {
-            double a = 2.0 - 2.0 * (double(t) / max_iter_);
+            gbest_score_ = std::numeric_limits<double>::infinity();
+            gbest_.assign(2, 0.0);
 
-            for (int i = 0; i < n_whales_; ++i)
+            for (int i = 0; i < swarm_size_; i++)
             {
-                std::vector<double> Xi = whales[i];
-                std::vector<double> X_new(2);
+                double fit = fitness(particles_[i], dx, dy);
 
-                std::vector<double> A(2), C(2);
-                for (int d = 0; d < 2; ++d)
+                if (fit < pbest_score_[i])
                 {
-                    double r1 = rand01(gen_);
-                    double r2 = rand01(gen_);
-                    A[d] = 2.0 * a * r1 - a;
-                    C[d] = 2.0 * r2;
+                    pbest_score_[i] = fit;
+                    pbest_[i] = particles_[i];
                 }
 
-                double p = rand01(gen_);
-                double l = randL(gen_);
-
-                if (p < 0.5)
+                if (fit < gbest_score_)
                 {
-                    double normA = std::sqrt(A[0]*A[0] + A[1]*A[1]);
-                    if (normA < 1.0)
-                    {
-                        for (int d = 0; d < 2; ++d)
-                        {
-                            double D = std::abs(C[d] * X_best[d] - Xi[d]);
-                            X_new[d] = X_best[d] - A[d] * D;
-                        }
-                    }
-                    else
-                    {
-                        int rand_idx = std::uniform_int_distribution<int>(0, n_whales_ - 1)(gen_);
-                        auto X_rand = whales[rand_idx];
-
-                        for (int d = 0; d < 2; ++d)
-                        {
-                            double D = std::abs(C[d] * X_rand[d] - Xi[d]);
-                            X_new[d] = X_rand[d] - A[d] * D;
-                        }
-                    }
+                    gbest_score_ = fit;
+                    gbest_ = particles_[i];
                 }
-                else
-                {
-                    for (int d = 0; d < 2; ++d)
-                    {
-                        double D = std::abs(X_best[d] - Xi[d]);
-                        X_new[d] = D * std::exp(b_ * l) * std::cos(2 * M_PI * l) + X_best[d];
-                    }
-                }
-
-                X_new[0] = std::clamp(X_new[0], -v_max_, v_max_);
-                X_new[1] = std::clamp(X_new[1], -w_max_, w_max_);
-
-                whales[i] = X_new;
             }
 
-            for (int i = 0; i < n_whales_; ++i)
-                fitness_vals[i] = fitness(whales[i], dx, dy);
-
-            int idx = std::min_element(fitness_vals.begin(), fitness_vals.end()) - fitness_vals.begin();
-
-            if (fitness_vals[idx] < F_best)
+            for (int i = 0; i < swarm_size_; i++)
             {
-                F_best = fitness_vals[idx];
-                X_best = whales[idx];
+                for (int d = 0; d < 2; d++)
+                {
+                    double r1 = r01(gen_);
+                    double r2 = r01(gen_);
+
+                    velocities_[i][d] =
+                        w_inertia_ * velocities_[i][d]
+                        + c1_ * r1 * (pbest_[i][d] - particles_[i][d])
+                        + c2_ * r2 * (gbest_[d] - particles_[i][d]);
+
+                    particles_[i][d] += velocities_[i][d];
+                }
+
+                particles_[i][0] = std::clamp(particles_[i][0], -v_max_, v_max_);
+                particles_[i][1] = std::clamp(particles_[i][1], -w_max_, w_max_);
             }
         }
 
-        return {X_best[0], X_best[1]};
+        return {gbest_[0], gbest_[1]};
     }
 
     std::pair<double,double> dwa_safety_filter(double v_cmd, double w_cmd)
@@ -248,12 +241,15 @@ private:
         for (int i = 0; i <= n_v + 1; ++i)
         {
             double v = min_v + i * v_reso_;
-            if (v > max_v + v_reso_ * 0.5) continue;
-
             for (int j = 0; j <= n_w + 1; ++j)
             {
                 double w = min_w + j * w_reso_;
-                if (w > max_w + w_reso_ * 0.5) continue;
+
+                if (std::isinf(v) || std::isinf(w))
+                    continue;
+
+                if (std::isnan(v) || std::isnan(w))
+                    continue;
 
                 auto traj = predict_trajectory(v, w);
                 double obstacle_cost = calc_obstacle_cost(traj);
@@ -281,7 +277,7 @@ private:
     }
 
     std::vector<std::pair<double,double>> predict_trajectory(double v, double w)
-    {
+    {   
         std::vector<std::pair<double,double>> traj;
         double x=0,y=0,yaw=0;
 
@@ -303,7 +299,7 @@ private:
 
         for(auto&p:traj)
         {
-            for(size_t i=0;i<scan_->ranges.size();++i)
+            for(size_t i=0; i<scan_->ranges.size(); ++i)
             {
                 double r=scan_->ranges[i];
                 if(std::isinf(r)||std::isnan(r)) continue;
@@ -315,12 +311,12 @@ private:
 
                 double dist=std::hypot(p.first-obs_x,p.second-obs_y);
 
-                if(dist<min_dist) min_dist=dist;
+                min_dist = std::min(min_dist, dist);
             }
         }
 
-        if(std::isinf(min_dist)) return 0.0;
-        if(min_dist<robot_radius_) return std::numeric_limits<double>::infinity();
+        if(min_dist < robot_radius_)
+            return std::numeric_limits<double>::infinity();
 
         return 1.0/(min_dist+0.01);
     }
@@ -335,6 +331,7 @@ private:
     void control_loop()
     {
         auto loop_start = std::chrono::high_resolution_clock::now();
+
         geometry_msgs::msg::TransformStamped trans;
 
         try
@@ -353,6 +350,7 @@ private:
         double heading = std::atan2(dy, dx);
 
         double v_cmd, w_cmd;
+
         if (std::abs(distance - d_ref_) < stop_threshold_ && std::abs(heading) < 0.08)
         {
             v_cmd = 0.0;
@@ -360,17 +358,15 @@ private:
         }
         else
         {
-            auto res = woa_optimize(dx, dy);
+            auto res = pso_optimize(dx, dy);
             v_cmd = res.first;
             w_cmd = res.second;
         }
 
         auto filtered = dwa_safety_filter(v_cmd, w_cmd);
-        v_cmd = filtered.first;
-        w_cmd = filtered.second;
 
-        double v = (1.0 - smooth_gain_) * v_cmd + smooth_gain_ * prev_v_;
-        double w = (1.0 - smooth_gain_) * w_cmd + smooth_gain_ * prev_w_;
+        double v = (1.0 - smooth_gain_) * filtered.first + smooth_gain_ * prev_v_;
+        double w = (1.0 - smooth_gain_) * filtered.second + smooth_gain_ * prev_w_;
 
         prev_v_ = v;
         prev_w_ = w;
@@ -380,6 +376,7 @@ private:
         cmd.angular.z = std::clamp(w, -w_max_, w_max_);
 
         cmd_pub_->publish(cmd);
+
         auto loop_end = std::chrono::high_resolution_clock::now();
         double loop_time_ms = std::chrono::duration<double, std::milli>(loop_end - loop_start).count();
 
@@ -387,7 +384,7 @@ private:
         double err_abs = std::abs(error);
         double heading_err_abs = std::abs(heading);
 
-        // --- Start detection after reaching setpoint zone ---
+        // --- Start detection after reaching setpoint ---
         if (!reached_setpoint_ && std::abs(error) < zero_band_)
         {
             reached_setpoint_ = true;
@@ -418,7 +415,7 @@ private:
             }
         }
 
-        // --- UNIFIED PARSER FORMAT ---
+        // --- MATCHES ALL OTHER LOGS ---
         RCLCPP_INFO(
             this->get_logger(),
             "err=%.3f | osc_count=%d | max_osc=%.3f | time=%.3f ms | heading_err=%.3f",
@@ -427,14 +424,14 @@ private:
             max_oscillation_,
             loop_time_ms,
             heading_err_abs
-        );       
+        );
     }
 };
 
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<WOA_Follow>());
+    rclcpp::spin(std::make_shared<PSO_Follow>());
     rclcpp::shutdown();
     return 0;
 }
