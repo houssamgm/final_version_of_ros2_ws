@@ -2,7 +2,7 @@
 ## Clone the repository
 ## 1. Clone the repository
 
- git clone https://github.com/houssamgm/ros2_ws.git
+ git clone https://github.com/houssamgm/final_version_of_ros2_ws.git
  
  cd ros2_ws
  
