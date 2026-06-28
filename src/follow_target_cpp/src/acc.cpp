@@ -17,25 +17,32 @@
 
 using std::placeholders::_1;
 
-class PIDFollow : public rclcpp::Node
+class ACCFollow : public rclcpp::Node
 {
 public:
-    PIDFollow()
-    : Node("pid_follow"),
+    ACCFollow()
+    : Node("acc_follow"),
       tf_buffer_(this->get_clock()),
       tf_listener_(tf_buffer_)
     {
-        // ---------- PID parameters ----------
-        d_ref_ = 0.7;
-        stop_threshold_ = 0.1; // Added for standardized time-to-reach tracking
+        // ---------- ACC parameters ----------
+        // Bounded Lower-Anchor Headway Policy
+        headway_time_ = 0.2;   // seconds
+        min_distance_ = 0.65;   // anchor at 0.67m to match WOA setpoint
         
-        Kp_ = 3;
-        Ki_ = 0.0;
-        Kd_ = 0.5;
-        Kp_angle_ = 3.0;
+        stop_threshold_ = 0.1; // Deadband threshold advantage
+
+        // Controller Gains
+        Kp_acc_ = 4;           // Gap error proportional gain
+        Kv_acc_ = 0.5;           // Relative velocity derivative gain
+        Kp_angle_ = 3;       // Heading gain
 
         v_max_ = 0.6;
-        w_max_ = 3;
+        w_max_ = 3.0;
+
+        // ACC Memory
+        prev_distance_ = min_distance_;
+        prev_time_ = this->get_clock()->now();
 
         // ---------- DWA safety parameters ----------
         max_accel_ = 0.6;
@@ -46,10 +53,9 @@ public:
         w_reso_ = 0.10;
         robot_radius_ = 0.22;
 
-        // PID memory
-        integral_ = 0.0;
-        prev_error_ = 0.0;
-        prev_time_ = this->get_clock()->now();
+        prev_v_ = 0.0;
+        prev_w_ = 0.0;
+        smooth_gain_ = 0.3;
         leader_v_ = 0.0;
         leader_w_ = 0.0;
 
@@ -60,29 +66,28 @@ public:
         cumulative_effort_w_ = 0.0;
 
         // Create the CSV file and write the header row
-        csv_file_.open("pid_tracking_data.csv");
+        csv_file_.open("acc_tracking_data.csv");
         if (csv_file_.is_open()) {
             csv_file_ << "timestamp,leader_v,leader_w,robot_v,robot_w,leader_x,leader_y,robot_x,robot_y,effort_v,effort_w\n";
         }
 
-        // ROS
         cmd_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
 
         scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
             "/scan", 10,
-            std::bind(&PIDFollow::scan_callback, this, _1));
+            std::bind(&ACCFollow::scan_callback, this, _1));
         // Added subscriber to get the leader's velocity for the graph
         leader_cmd_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
-            "/leader/cmd_vel", 10, std::bind(&PIDFollow::leader_cmd_callback, this, _1));
+            "/leader/cmd_vel", 10, std::bind(&ACCFollow::leader_cmd_callback, this, _1));
 
         timer_ = this->create_wall_timer(
             std::chrono::milliseconds(50),
-            std::bind(&PIDFollow::control_loop, this));
+            std::bind(&ACCFollow::control_loop, this));
 
-        RCLCPP_INFO(this->get_logger(), "PID follower with Control Effort Metrics started");
+        RCLCPP_INFO(this->get_logger(), "ACC follower with Control Effort Metrics started");
     }
     // Destructor to safely close the file when the node is killed
-    ~PIDFollow()
+    ~ACCFollow()
     {
         if (csv_file_.is_open()) {
             csv_file_.close();
@@ -91,11 +96,12 @@ public:
 
 private:
     // ---------- Parameters ----------
-    double d_ref_;
+    // ACC gains & spacing
+    double headway_time_;
+    double min_distance_;
     double stop_threshold_;
-    double Kp_;
-    double Ki_;
-    double Kd_;
+    double Kp_acc_;
+    double Kv_acc_;
     double Kp_angle_;
 
     double v_max_;
@@ -121,7 +127,11 @@ private:
     rclcpp::Time start_time_;
     double time_to_reach_ = 0.0;
 
-    // ---------- PID memory ----------
+    // ACC Memory
+    double prev_distance_;
+    rclcpp::Time prev_time_;
+
+    // smoothing
     double prev_v_ = 0.0;
     double prev_w_ = 0.0;
     double smooth_gain_ = 0.3;
@@ -134,11 +144,7 @@ private:
     std::ofstream csv_file_; // File writer
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr leader_cmd_sub_;
 
-    double integral_;
-    double prev_error_;
-    rclcpp::Time prev_time_;
-
-    // ---------- ROS ----------
+    // ROS
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
@@ -191,60 +197,41 @@ private:
 
         for (const auto & point : traj)
         {
-            double x = point.first;
-            double y = point.second;
-
             for (size_t i = 0; i < scan_->ranges.size(); ++i)
             {
                 double r = scan_->ranges[i];
+                if (std::isinf(r) || std::isnan(r)) continue;
 
-                if (std::isinf(r) || std::isnan(r))
-                {
-                    continue;
-                }
-
-                double angle = scan_->angle_min + static_cast<double>(i) * scan_->angle_increment;
+                double angle = scan_->angle_min + i * scan_->angle_increment;
 
                 double obs_x = r * std::cos(angle);
                 double obs_y = r * std::sin(angle);
 
-                double dist = std::hypot(x - obs_x, y - obs_y);
+                double dist = std::hypot(point.first - obs_x, point.second - obs_y);
 
                 if (dist < min_dist)
-                {
                     min_dist = dist;
-                }
             }
         }
 
-        if (std::isinf(min_dist))
-        {
-            return 0.0;
-        }
-
-        if (min_dist < robot_radius_)
-        {
-            return std::numeric_limits<double>::infinity();
-        }
+        if (std::isinf(min_dist)) return 0.0;
+        if (min_dist < robot_radius_) return std::numeric_limits<double>::infinity();
 
         return 1.0 / (min_dist + 0.01);
     }
 
     // --------------------------------------------------
-    std::pair<double, double> dwa_safety_filter(double v_pid, double w_pid)
+    std::pair<double, double> dwa_safety_filter(double v_cmd, double w_cmd)
     {
-        if (!scan_)
-        {
-            return {v_pid, w_pid};
-        }
+        if (!scan_) return {v_cmd, w_cmd};
 
-        double min_v = std::max(-v_max_, v_pid - max_accel_ * dt_sim_);
-        double max_v = std::min(v_max_,  v_pid + max_accel_ * dt_sim_);
+        double min_v = std::max(-v_max_, v_cmd - max_accel_ * dt_sim_);
+        double max_v = std::min(v_max_,  v_cmd + max_accel_ * dt_sim_);
 
-        double angle_expand = (std::abs(v_pid) > 0.05) ? 0.7 : 0.4;
+        double angle_expand = (std::abs(v_cmd) > 0.05) ? 0.7 : 0.4;
 
-        double min_w = std::max(-w_max_, w_pid - max_delta_w_ * dt_sim_ - angle_expand);
-        double max_w = std::min(w_max_,  w_pid + max_delta_w_ * dt_sim_ + angle_expand);
+        double min_w = std::max(-w_max_, w_cmd - max_delta_w_ * dt_sim_ - angle_expand);
+        double max_w = std::min(w_max_,  w_cmd + max_delta_w_ * dt_sim_ + angle_expand);
 
         double best_v = 0.0;
         double best_w = 0.0;
@@ -256,29 +243,20 @@ private:
 
         for (int i = 0; i <= n_v + 1; ++i)
         {
-            double v = min_v + static_cast<double>(i) * v_reso_;
-            if (v > max_v + v_reso_ * 0.5)
-            {
-                continue;
-            }
+            double v = min_v + i * v_reso_;
+            if (v > max_v + v_reso_ * 0.5) continue;
 
             for (int j = 0; j <= n_w + 1; ++j)
             {
-                double w = min_w + static_cast<double>(j) * w_reso_;
-                if (w > max_w + w_reso_ * 0.5)
-                {
-                    continue;
-                }
+                double w = min_w + j * w_reso_;
+                if (w > max_w + w_reso_ * 0.5) continue;
 
                 auto traj = predict_trajectory(v, w);
                 double obstacle_cost = calc_obstacle_cost(traj);
 
-                if (std::isinf(obstacle_cost))
-                {
-                    continue;
-                }
+                if (std::isinf(obstacle_cost)) continue;
 
-                double tracking_cost = std::abs(v - v_pid) + std::abs(w - w_pid);
+                double tracking_cost = std::abs(v - v_cmd) + std::abs(w - w_cmd);
                 double final_cost = 3.5 * obstacle_cost + 4.0 * tracking_cost;
 
                 if (final_cost < min_cost)
@@ -292,9 +270,7 @@ private:
         }
 
         if (!found)
-        {
             return {-0.35, 0.8};
-        }
 
         return {best_v, best_w};
     }
@@ -310,6 +286,8 @@ private:
     void control_loop()
     {
         auto loop_start = std::chrono::high_resolution_clock::now();
+        rclcpp::Time now = this->get_clock()->now();
+
         geometry_msgs::msg::TransformStamped trans;
 
         try
@@ -337,43 +315,61 @@ private:
 
         double distance = std::sqrt(dx * dx + dy * dy);
 
-        // ---------- Distance PID ----------
-        double error = distance - d_ref_;
-        double err_abs = std::abs(error);
-
-        rclcpp::Time now = this->get_clock()->now();
+        // =========================================================
+        //                🚗 KINEMATIC ACC CONTROLLER
+        // =========================================================
+        
+        // Calculate dt for derivative
         double dt = (now - prev_time_).nanoseconds() / 1e9;
-        if (dt == 0.0)
-        {
-            return;
-        }
+        if (dt <= 0.0) return;
 
-        // --- PID memory update ---
-        integral_ += error * dt;
-        double derivative = (error - prev_error_) / dt;
+        // Estimate raw relative velocity without the low-pass filter
+        double raw_rel_vel = (distance - prev_distance_) / dt;
 
-        // --- RAW PID output ---
-        double v_raw = Kp_ * error + Ki_ * integral_ + Kd_ * derivative;
-        v_raw = std::max(std::min(v_raw, v_max_), -v_max_);
+        // 1. Determine Desired Gap (Bounded Lower-Anchor policy)
+        double desired_gap = min_distance_ + headway_time_ * std::max(0.0, prev_v_);
+        
+        // 2. Calculate Gap Error
+        double gap_error = distance - desired_gap;
 
-        // ---------- Heading ----------
+        // Angular calculations needed for deadband & tracking
         double angle_error = std::atan2(dy, dx);
         double heading_err_abs = std::abs(angle_error);
 
-        double w_raw = Kp_angle_ * angle_error;
-        w_raw = std::max(std::min(w_raw, w_max_), -w_max_);
+        double v_raw, w_raw;
 
-        // ---------- DWA Obstacle Layer ----------
+        // Deadband Advantage Logic (Matches WOA)
+        if (std::abs(gap_error) < stop_threshold_ && heading_err_abs < 0.08)
+        {
+            v_raw = 0.0;
+            w_raw = 0.0;
+        }
+        else
+        {
+            // 3. ACC Control Law (PD on gap distance with raw derivative)
+            double v_acc = Kp_acc_ * gap_error + Kv_acc_ * raw_rel_vel;
+            v_raw = std::clamp(v_acc, -v_max_, v_max_);
+
+            // Angular controller
+            double w_acc = Kp_angle_ * angle_error;
+            w_raw = std::clamp(w_acc, -w_max_, w_max_);
+        }
+
+        // Update memory for next loop
+        prev_distance_ = distance;
+        prev_time_ = now;
+
+        // =========================================================
+        // DWA layer
+        // =========================================================
         auto filtered = dwa_safety_filter(v_raw, w_raw);
 
-        // --- SMOOTHING (AFTER DWA) ---
         double v = (1.0 - smooth_gain_) * filtered.first + smooth_gain_ * prev_v_;
         double w = (1.0 - smooth_gain_) * filtered.second + smooth_gain_ * prev_w_;
 
         prev_v_ = v;
         prev_w_ = w;
 
-        // ---------- Publish ----------
         geometry_msgs::msg::Twist cmd;
         cmd.linear.x = v;
         cmd.angular.z = w;
@@ -419,14 +415,15 @@ private:
         }
         // ==========================================
 
-        prev_error_ = error;
-        prev_time_ = now;
-
         auto loop_end = std::chrono::high_resolution_clock::now();
-        double loop_time_ms = std::chrono::duration<double, std::milli>(loop_end - loop_start).count();
+        double loop_time_ms =
+            std::chrono::duration<double, std::milli>(loop_end - loop_start).count();
+
+        double err_abs = std::abs(gap_error);
 
         // --- Start detection and lock in Reach Time ---
-        if (!reached_setpoint_ && std::abs(error) <= stop_threshold_)
+        // Changed condition to trigger specifically on the stop_threshold_ bound
+        if (!reached_setpoint_ && std::abs(gap_error) <= stop_threshold_)
         {
             reached_setpoint_ = true;
             prev_sign_ = 0;
@@ -436,16 +433,16 @@ private:
             RCLCPP_INFO(this->get_logger(), ">>> LEADER REACHED IN %.3f SECONDS <<<", time_to_reach_);
         }
 
-        // --- Oscillation Tracking Logic (Distance error based) ---
+        // --- Oscillation Tracking Logic ---
         if (reached_setpoint_)
         {
-            int current_sign = sign_of(error);
+            int current_sign = sign_of(gap_error);
 
             if (current_sign != 0)
             {
-                if (std::abs(error) > max_oscillation_)
+                if (std::abs(gap_error) > max_oscillation_)
                 {
-                    max_oscillation_ = std::abs(error);
+                    max_oscillation_ = std::abs(gap_error);
                 }
             }
 
@@ -460,7 +457,7 @@ private:
             }
         }
 
-        // --- UPDATED PARSER FORMAT ---
+        // --- UNIFIED PARSER FORMAT ---
         RCLCPP_INFO(
             this->get_logger(),
             "err=%.3f | osc=%d | max_osc=%.3f | t=%.3f ms | head_err=%.3f | eff_v=%.3f | eff_w=%.3f",
@@ -472,7 +469,7 @@ private:
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<PIDFollow>();
+    auto node = std::make_shared<ACCFollow>();
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
