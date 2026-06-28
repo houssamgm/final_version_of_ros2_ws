@@ -27,7 +27,7 @@ setup(
         'console_scripts': [
             'guide_node = diffbot_sim.guide_node:main',
             'trajectory = diffbot_sim.trajectory:main',
-            'dynamic_obstacles = diffbot_sim.dynamic_obstacles:main',
+            'cmd_vel_mux = diffbot_sim.cmd_vel_mux:main'
         ],
     },
 )

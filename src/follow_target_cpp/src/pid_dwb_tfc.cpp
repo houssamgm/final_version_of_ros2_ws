@@ -59,7 +59,7 @@ public:
             std::chrono::milliseconds(100),
             std::bind(&PIDFollow::control_loop, this));
 
-        RCLCPP_INFO(this->get_logger(), "PID follower with heading error metric started");
+        RCLCPP_INFO(this->get_logger(), "PID follower with DWA obstacle layer started");
     }
 
 private:
@@ -80,13 +80,6 @@ private:
     double v_reso_;
     double w_reso_;
     double robot_radius_;
-
-    // ===== Metrics and Oscillation Tracking Variables =====
-    bool reached_setpoint_ = false;
-    double zero_band_ = 0.02;
-    int oscillation_count_ = 0;
-    double max_oscillation_ = 0.0;
-    int prev_sign_ = 0;
 
     // ---------- PID memory ----------
     double prev_v_ = 0.0;
@@ -176,11 +169,13 @@ private:
             return 0.0;
         }
 
+        // Hard collision only if extremely close
         if (min_dist < robot_radius_)
         {
             return std::numeric_limits<double>::infinity();
         }
 
+        // Smooth penalty
         return 1.0 / (min_dist + 0.01);
     }
 
@@ -195,6 +190,7 @@ private:
         double min_v = std::max(-v_max_, v_pid - max_accel_ * dt_sim_);
         double max_v = std::min(v_max_,  v_pid + max_accel_ * dt_sim_);
 
+        // widen angular search around forward motion
         double angle_expand = (std::abs(v_pid) > 0.05) ? 0.7 : 0.4;
 
         double min_w = std::max(-w_max_, w_pid - max_delta_w_ * dt_sim_ - angle_expand);
@@ -205,6 +201,7 @@ private:
         double min_cost = std::numeric_limits<double>::infinity();
         bool found = false;
 
+        // Integer-based sampling to mimic Python np.arange much better
         int n_v = static_cast<int>(std::floor((max_v - min_v) / v_reso_));
         int n_w = static_cast<int>(std::floor((max_w - min_w) / w_reso_));
 
@@ -245,6 +242,7 @@ private:
             }
         }
 
+        // If everything unsafe -> rotate to search free space
         if (!found)
         {
             return {0.0, 0.8};
@@ -253,17 +251,10 @@ private:
         return {best_v, best_w};
     }
 
-    int sign_of(double x)
-    {
-        if (x > zero_band_) return 1;
-        if (x < -zero_band_) return -1;
-        return 0;
-    }
-
     // --------------------------------------------------
     void control_loop()
     {
-        auto loop_start = std::chrono::high_resolution_clock::now();
+        auto loop_start = std::chrono::high_resolution_clock::now();  // <-- ADD
         geometry_msgs::msg::TransformStamped trans;
 
         try
@@ -285,7 +276,6 @@ private:
 
         // ---------- Distance PID ----------
         double error = distance - d_ref_;
-        double err_abs = std::abs(error);
 
         rclcpp::Time now = this->get_clock()->now();
         double dt = (now - prev_time_).nanoseconds() / 1e9;
@@ -304,10 +294,11 @@ private:
 
         // ---------- Heading ----------
         double angle_error = std::atan2(dy, dx);
-        double heading_err_abs = std::abs(angle_error);
 
         double w_raw = Kp_angle_ * angle_error;
         w_raw = std::max(std::min(w_raw, w_max_), -w_max_);
+
+        
 
         // ---------- DWA Obstacle Layer ----------
         auto filtered = dwa_safety_filter(v_raw, w_raw);
@@ -316,6 +307,7 @@ private:
         double v = (1.0 - smooth_gain_) * filtered.first + smooth_gain_ * prev_v_;
         double w = (1.0 - smooth_gain_) * filtered.second + smooth_gain_ * prev_w_;
 
+        // store for next iteration
         prev_v_ = v;
         prev_w_ = w;
 
@@ -327,51 +319,13 @@ private:
 
         prev_error_ = error;
         prev_time_ = now;
-
-        auto loop_end = std::chrono::high_resolution_clock::now();
+        auto loop_end = std::chrono::high_resolution_clock::now();  // <-- ADD
         double loop_time_ms = std::chrono::duration<double, std::milli>(loop_end - loop_start).count();
 
-        // --- Start detection after reaching setpoint zone ---
-        if (!reached_setpoint_ && std::abs(error) < zero_band_)
-        {
-            reached_setpoint_ = true;
-            prev_sign_ = 0;
-        }
+        double err_abs = std::abs(distance - d_ref_);
+        RCLCPP_INFO(this->get_logger(),"err=%.3f", err_abs);        
+        RCLCPP_INFO(this->get_logger(), "PID+DWA total loop time = %.3f ms", loop_time_ms);
 
-        // --- Oscillation Tracking Logic (Distance error based) ---
-        if (reached_setpoint_)
-        {
-            int current_sign = sign_of(error);
-
-            if (current_sign != 0)
-            {
-                if (std::abs(error) > max_oscillation_)
-                {
-                    max_oscillation_ = std::abs(error);
-                }
-            }
-
-            if (current_sign != 0 && prev_sign_ != 0 && current_sign != prev_sign_)
-            {
-                oscillation_count_++;
-            }
-
-            if (current_sign != 0)
-            {
-                prev_sign_ = current_sign;
-            }
-        }
-
-        // --- UPDATED PARSER FORMAT ---
-        RCLCPP_INFO(
-            this->get_logger(),
-            "err=%.3f | osc_count=%d | max_osc=%.3f | time=%.3f ms | heading_err=%.3f",
-            err_abs,
-            oscillation_count_,
-            max_oscillation_,
-            loop_time_ms,
-            heading_err_abs
-        );
     }
 };
 

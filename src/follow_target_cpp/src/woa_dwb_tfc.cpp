@@ -23,7 +23,7 @@ public:
       tf_listener_(tf_buffer_)
     {
         d_ref_ = 0.7;
-        stop_threshold_ = 0.1;
+        stop_threshold_ = 0.05;
 
         v_max_ = 0.6;
         w_max_ = 3;
@@ -31,10 +31,10 @@ public:
         alpha_ = 2.0;
         beta_ = 1.5;
 
-        n_whales_ = 20;
+        n_whales_ = 30;
         max_iter_ = 50;
 
-        dt_ = 0.3;
+        dt_ = 0.6;
         b_ = 1.0;
 
         max_accel_ = 0.6;
@@ -47,9 +47,9 @@ public:
 
         prev_v_ = 0.0;
         prev_w_ = 0.0;
-        smooth_gain_ = 0.3;
+        smooth_gain_ = 0.2;
 
-        cmd_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
+        cmd_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/woa_cmd_vel", 10);
 
         scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
             "/scan", 10, std::bind(&WOA_Follow::scan_callback, this, _1));
@@ -58,7 +58,7 @@ public:
             std::chrono::milliseconds(100),
             std::bind(&WOA_Follow::control_loop, this));
 
-        RCLCPP_INFO(this->get_logger(), "WOA follower with unified metrics logging started");
+        RCLCPP_INFO(this->get_logger(), "WOA follower with Vectorized A/C coefficients started");
     }
 
 private:
@@ -72,13 +72,6 @@ private:
     double predict_time_, dt_sim_;
     double v_reso_, w_reso_;
     double robot_radius_;
-
-    // ===== Metrics and Oscillation Tracking Variables =====
-    bool reached_setpoint_ = false;
-    double zero_band_ = 0.02;
-    int oscillation_count_ = 0;
-    double max_oscillation_ = 0.0;
-    int prev_sign_ = 0;
 
     double prev_v_, prev_w_, smooth_gain_;
 
@@ -160,6 +153,7 @@ private:
                 std::vector<double> Xi = whales[i];
                 std::vector<double> X_new(2);
 
+                // --- CHANGE APPLIED HERE: Vectorized A and C ---
                 std::vector<double> A(2), C(2);
                 for (int d = 0; d < 2; ++d)
                 {
@@ -325,13 +319,6 @@ private:
         return 1.0/(min_dist+0.01);
     }
 
-    int sign_of(double x)
-    {
-        if (x > zero_band_) return 1;
-        if (x < -zero_band_) return -1;
-        return 0;
-    }
-
     void control_loop()
     {
         auto loop_start = std::chrono::high_resolution_clock::now();
@@ -383,51 +370,9 @@ private:
         auto loop_end = std::chrono::high_resolution_clock::now();
         double loop_time_ms = std::chrono::duration<double, std::milli>(loop_end - loop_start).count();
 
-        double error = distance - d_ref_;
-        double err_abs = std::abs(error);
-        double heading_err_abs = std::abs(heading);
-
-        // --- Start detection after reaching setpoint zone ---
-        if (!reached_setpoint_ && std::abs(error) < zero_band_)
-        {
-            reached_setpoint_ = true;
-            prev_sign_ = 0;
-        }
-
-        // --- Oscillation Tracking Logic ---
-        if (reached_setpoint_)
-        {
-            int current_sign = sign_of(error);
-
-            if (current_sign != 0)
-            {
-                if (std::abs(error) > max_oscillation_)
-                {
-                    max_oscillation_ = std::abs(error);
-                }
-            }
-
-            if (current_sign != 0 && prev_sign_ != 0 && current_sign != prev_sign_)
-            {
-                oscillation_count_++;
-            }
-
-            if (current_sign != 0)
-            {
-                prev_sign_ = current_sign;
-            }
-        }
-
-        // --- UNIFIED PARSER FORMAT ---
-        RCLCPP_INFO(
-            this->get_logger(),
-            "err=%.3f | osc_count=%d | max_osc=%.3f | time=%.3f ms | heading_err=%.3f",
-            err_abs,
-            oscillation_count_,
-            max_oscillation_,
-            loop_time_ms,
-            heading_err_abs
-        );       
+        double error = std::abs(distance - d_ref_);
+        RCLCPP_INFO(this->get_logger(),"err=%.3f", error);
+        RCLCPP_INFO(this->get_logger(),"WOA+DWA total loop time = %.3f ms", loop_time_ms);        
     }
 };
 

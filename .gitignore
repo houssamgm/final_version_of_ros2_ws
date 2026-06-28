@@ -1,16 +1,11 @@
-# ROS2 build files
 build/
 install/
 log/
 
-# Colcon
-*.log
-
-# Python
-__pycache__/
 *.pyc
-
-# OS
-.DS_Store
+__pycache__/
 
 .vscode/
+.idea/
+
+.DS_Store

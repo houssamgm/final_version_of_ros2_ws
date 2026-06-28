@@ -32,11 +32,11 @@ ament_target_dependencies(pid_dwb_tfc rclcpp geometry_msgs sensor_msgs tf2_ros)
 add_executable(woa_dwb_tfc src/woa_dwb_tfc.cpp)
 ament_target_dependencies(woa_dwb_tfc rclcpp geometry_msgs sensor_msgs tf2_ros)
 
-add_executable(acc src/acc.cpp)
-ament_target_dependencies(acc rclcpp geometry_msgs sensor_msgs tf2_ros)
+add_executable(pid_dwb_lidarc src/pid_dwb_lidarc.cpp)
+ament_target_dependencies(pid_dwb_lidarc rclcpp geometry_msgs sensor_msgs tf2_ros)
 
-add_executable(pso src/pso.cpp)
-ament_target_dependencies(pso rclcpp geometry_msgs sensor_msgs tf2_ros)
+add_executable(woa_dwb_lidarc src/woa_dwb_lidarc.cpp)
+ament_target_dependencies(woa_dwb_lidarc rclcpp geometry_msgs sensor_msgs tf2_ros)
 
 add_executable(org_woa_lidar src/org_woa_lidar.cpp)
 ament_target_dependencies(org_woa_lidar rclcpp geometry_msgs sensor_msgs tf2_ros)
@@ -47,8 +47,8 @@ ament_target_dependencies(org_woa_lidar rclcpp geometry_msgs sensor_msgs tf2_ros
 install(TARGETS
   pid_dwb_tfc
   woa_dwb_tfc
-  acc
-  pso
+  pid_dwb_lidarc
+  woa_dwb_lidarc
   org_woa_lidar
   #dwa
   DESTINATION lib/${PROJECT_NAME}

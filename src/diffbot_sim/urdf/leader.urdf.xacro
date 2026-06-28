@@ -100,7 +100,7 @@
   </link>
 
   <gazebo reference="chassis">
-    <material>Gazebo/Red</material>
+    <material>Gazebo/Green</material>
   </gazebo>
 
   <joint name="front_left_wheel_joint" type="continuous">
